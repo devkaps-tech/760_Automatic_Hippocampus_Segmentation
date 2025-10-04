@@ -1,0 +1,6 @@
+1. Using 3D-UNET with CBAM and regression with 50 epochs and train.repeat() 
+* loss: 0.4092 - reg_loss: 0.2640 - reg_rmse: 0.4420 - seg_dice_coef: 0.8576 - seg_jaccard_coef: 0.7516 - seg_loss: 0.1452 - val_loss: 4.5888 - val_reg_loss: 4.3519 - val_reg_rmse: 1.5538 - val_seg_dice_coef: 0.7114 - val_seg_jaccard_coef: 0.5581 - val_seg_loss: 0.2368
+* gen files saved in Iteration 3 
+* Mean Dice:    0.6878
+* Mean Jaccard: 0.5376
+* * Regression RMSE: 1.7264
