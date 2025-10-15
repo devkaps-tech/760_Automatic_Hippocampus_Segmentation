@@ -1,382 +1,582 @@
-# Stage B: Attention-Enhanced 3D U-Net for Hippocampus Segmentation
+# Stage B: Loss-Weighted Multimodal 3D Attention U-Net for Hippocampus Segmentation and CDR Classification
 
 ## Overview
 
-Stage B enhances the baseline 3D U-Net from Stage A by incorporating attention mechanisms. This stage introduces spatial and channel attention modules to improve feature representation and segmentation accuracy. The attention mechanisms help the model focus on relevant hippocampus regions while suppressing irrelevant background information.
+    Stage B introduces **loss weighting strategies** to address task imbalance between segmentation and classification, as well as **class imbalance** in the CDR classification task. The architecture remains identical to Stage D (3D Attention U-Net with multimodal fusion), but explores different loss weighting configurations and weighted classification loss functions.
+
+**Key Innovation**: Rather than architectural changes, Stage B focuses on training strategy optimization through:
+- Multiple loss weight configurations
+- Weighted categorical cross-entropy for class imbalance
+- Systematic comparison of training approaches
 
 ## Architecture
 
-### Model: 3D Attention U-Net
+### Model: 3D Attention U-Net with CDR Classification
 
-Building upon Stage A, this model integrates:
+    The model architecture is identical to Stage D, consisting of:
 
-- **Spatial Attention**: Focuses on important spatial locations
-- **Channel Attention**: Emphasizes relevant feature channels
-- **Skip Connection Enhancement**: Attention-guided feature fusion
-- **Multi-scale Processing**: Improved feature extraction at different scales
-
-### Key Attention Components
-
+1. **Attention U-Net Encoder**: 3D convolution blocks with attention gates
+2. **Bottleneck**: Global average pooling for feature extraction
+3. **Multimodal Fusion**: Integration of imaging and clinical features
+4. **Dual Task Decoders**:
+   - Segmentation branch with attention-guided skip connections
+   - Classification branch for CDR prediction
 ```python
-# Spatial Attention Module
-def spatial_attention_3d(input_feature):
-    avg_pool = GlobalAveragePooling3D(keepdims=True)(input_feature)
-    max_pool = GlobalMaxPooling3D(keepdims=True)(input_feature)
+def build_att_unet3d_with_class(
+    input_shape=(128,128,128,1),
+    tabular_dim=7,  # Clinical features
+    base_filters=32,
+    class_hidden=(128,64),
+    dropout_rate=0.2,  # Note: Also tested with dropout=0
+    num_classes=4  # Healthy, Very Mild, Mild, Moderate
+):
+    """
+    Attention U-Net with classification branch
+    Same architecture as Stage D
+    """
+    # Image input
+    img_in = layers.Input(shape=input_shape, name="img_input")
     
-    concat = Concatenate(axis=-1)([avg_pool, max_pool])
-    attention = Conv3D(1, 7, activation='sigmoid', padding='same')(concat)
+    # Encoder with attention
+    c1 = conv_block(img_in, base_filters, dropout_rate)
+    p1 = layers.MaxPooling3D((2,2,2))(c1)
     
-    return Multiply()([input_feature, attention])
-
-# Channel Attention Module  
-def channel_attention_3d(input_feature, ratio=8):
-    channel = input_feature.shape[-1]
+    c2 = conv_block(p1, base_filters*2, dropout_rate)
+    p2 = layers.MaxPooling3D((2,2,2))(c2)
     
-    avg_pool = GlobalAveragePooling3D()(input_feature)
-    avg_pool = Dense(channel//ratio, activation='relu')(avg_pool)
-    avg_pool = Dense(channel, activation='sigmoid')(avg_pool)
-    avg_pool = Reshape((1, 1, 1, channel))(avg_pool)
+    c3 = conv_block(p2, base_filters*4, dropout_rate)
+    p3 = layers.MaxPooling3D((2,2,2))(c3)
     
-    max_pool = GlobalMaxPooling3D()(input_feature)
-    max_pool = Dense(channel//ratio, activation='relu')(max_pool)
-    max_pool = Dense(channel, activation='sigmoid')(max_pool)
-    max_pool = Reshape((1, 1, 1, channel))(max_pool)
+    c4 = conv_block(p3, base_filters*8, dropout_rate)
+    p4 = layers.MaxPooling3D((2,2,2))(c4)
     
-    attention = Add()([avg_pool, max_pool])
-    return Multiply()([input_feature, attention])
-
-# Combined CBAM Module
-def cbam_block_3d(input_feature):
-    cbam_feature = channel_attention_3d(input_feature)
-    cbam_feature = spatial_attention_3d(cbam_feature)
-    return cbam_feature
+    # Bottleneck
+    bn = conv_block(p4, base_filters*16, dropout_rate)
+    bn_vec = layers.GlobalAveragePooling3D(name="bn_gap")(bn)
+    
+    # Multimodal fusion
+    if tabular_dim > 0:
+        tab_in = layers.Input(shape=(tabular_dim,), name="tab_input")
+        t = layers.Dense(64, activation='relu')(tab_in)
+        fused = layers.Concatenate()([bn_vec, t])
+        inputs = [img_in, tab_in]
+    else:
+        fused = bn_vec
+        inputs = [img_in]
+    
+    # Classification branch
+    c = fused
+    for i, units in enumerate(class_hidden):
+        c = layers.Dense(units, activation='relu')(c)
+        c = layers.Dropout(dropout_rate)(c)
+    class_out = layers.Dense(num_classes, activation='softmax', name="cdr_class")(c)
+    
+    # Decoder with attention gates (same as Stage D)
+    # ... [decoder implementation] ...
+    
+    # Segmentation output
+    seg_out = layers.Conv3D(1, 1, activation='sigmoid', name="seg")(c8)
+    
+    model = models.Model(inputs=inputs, outputs=[seg_out, class_out])
+    return model
 ```
 
-## Enhanced Architecture Design
-
-### Encoder with Attention
-
+### Attention Gate Mechanism
 ```python
-# Enhanced encoder path with CBAM attention
-def attention_encoder_block(inputs, filters, dropout_rate=0.1):
-    conv = Conv3D(filters, 3, activation='relu', padding='same')(inputs)
-    conv = BatchNormalization()(conv)
-    conv = Dropout(dropout_rate)(conv)
+def attention_gate(x, g, inter_channels):
+    """
+    Attention gate for skip connections
+    x: skip connection features
+    g: gating signal from coarser scale
+    """
+    theta_x = layers.Conv3D(inter_channels, 2, strides=2, padding='same')(x)
+    phi_g = layers.Conv3D(inter_channels, 1, padding='same')(g)
     
-    conv = Conv3D(filters, 3, activation='relu', padding='same')(conv)
-    conv = BatchNormalization()(conv)
+    add = layers.Add()([theta_x, phi_g])
+    act = layers.ReLU()(add)
     
-    # Apply CBAM attention
-    attention_conv = cbam_block_3d(conv)
+    psi = layers.Conv3D(1, 1, padding='same', activation='sigmoid')(act)
+    upsampled_psi = layers.UpSampling3D(size=(2,2,2))(psi)
     
-    pool = MaxPooling3D(pool_size=(2, 2, 2))(attention_conv)
-    return attention_conv, pool
+    attn_out = layers.Multiply()([x, upsampled_psi])
+    return attn_out
 ```
 
-### Decoder with Attention-Guided Skip Connections
+## Loss Weighting Experiments
 
+### Experiment 1: Loss Weights {seg: 0.8, cdr_class: 1.2}
+
+**Configuration**:
 ```python
-# Attention-guided decoder block
-def attention_decoder_block(inputs, skip_features, filters):
-    up = UpSampling3D(size=(2, 2, 2))(inputs)
-    
-    # Apply attention to skip connections
-    attended_skip = cbam_block_3d(skip_features)
-    
-    # Concatenate with attention-weighted features
-    merge = Concatenate(axis=-1)([up, attended_skip])
-    
-    conv = Conv3D(filters, 3, activation='relu', padding='same')(merge)
-    conv = BatchNormalization()(conv)
-    conv = Conv3D(filters, 3, activation='relu', padding='same')(conv)
-    conv = BatchNormalization()(conv)
-    
-    return conv
+dropout_rate = 0
+alpha, beta = 0.5, 0.5  # Tversky loss balance
+BATCH_SIZE = 4
+optimizer = AdamW(learning_rate=2e-3, weight_decay=1e-5)
+
+model.compile(
+    optimizer=optimizer,
+    loss={
+        'seg': make_tversky_loss(alpha=0.5, beta=0.5),
+        'cdr_class': 'categorical_crossentropy'
+    },
+    loss_weights={'seg': 0.8, 'cdr_class': 1.2},
+    metrics={
+        'seg': [dice_coef, jaccard_coef],
+        'cdr_class': ['accuracy']
+    }
+)
 ```
 
-## Data Processing
+**Training Results** (20 epochs):
+- **Validation Dice**: 0.6615
+- **Validation Jaccard**: 0.4948
+- **Validation Classification Accuracy**: 0% (highly unstable)
 
-### Enhanced Preprocessing
-
-Stage B uses the same data processing pipeline as Stage A but with additional augmentation strategies:
-
-```python
-# Enhanced data augmentation for attention training
-def enhanced_augmentation(image, mask):
-    # Spatial augmentations
-    if random.random() > 0.5:
-        image, mask = random_rotation_3d(image, mask, max_angle=15)
-    
-    if random.random() > 0.5:
-        image, mask = random_scaling_3d(image, mask, scale_range=(0.9, 1.1))
-    
-    # Intensity augmentations
-    if random.random() > 0.5:
-        image = random_brightness_3d(image, brightness_range=(-0.1, 0.1))
-    
-    if random.random() > 0.5:
-        image = random_contrast_3d(image, contrast_range=(0.9, 1.1))
-    
-    return image, mask
+**Final Test Results**:
+```
+Mean Dice: 0.7147
+Mean Jaccard: 0.5596
+Classification Accuracy: 0.2000
 ```
 
-### Attention-Aware Data Loading
+**Confusion Matrix**:
+- Predicted all samples as Moderate (class 3)
+- Poor classification performance due to weight imbalance
 
+### Experiment 2: Loss Weights {seg: 0.9, cdr_class: 1.1}
+
+**Configuration**:
 ```python
-# Data generator with attention-aware preprocessing
-class AttentionDataGenerator(tf.keras.utils.Sequence):
-    def __init__(self, image_paths, mask_paths, clinical_data, 
-                 batch_size=4, shuffle=True, augment=True):
-        self.image_paths = image_paths
-        self.mask_paths = mask_paths
-        self.clinical_data = clinical_data
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.augment = augment
-        self.on_epoch_end()
+dropout_rate = 0
+alpha, beta = 0.5, 0.5
+loss_weights={'seg': 0.9, 'cdr_class': 1.1}
+```
+
+**Training Results** (20 epochs):
+- **Validation Dice**: 0.5539
+- **Validation Jaccard**: 0.4059
+- **Validation Classification Accuracy**: 100%
+
+**Final Test Results**:
+```
+Mean Dice: 0.6136
+Mean Jaccard: 0.4558
+Classification Accuracy: 0.8000 (8/10 correct)
+```
+
+**Confusion Matrix**:
+```
+[[8, 0, 0, 0],    # Healthy: 8/8 correct
+ [0, 0, 0, 0],    # Very Mild: none in test set
+ [0, 0, 0, 0],    # Mild: none in test set
+ [2, 0, 0, 0]]    # Moderate: 0/2 correct (misclassified as Healthy)
+```
+
+**Performance Metrics**:
+- **Healthy Class**: Precision 0.8000, Recall 1.0000, F1-Score 0.8889
+- **Moderate Class**: Precision 0.0000, Recall 0.0000, F1-Score 0.0000
+
+### Experiment 3: Weighted Categorical Cross-Entropy
+
+**Class Distribution Analysis**:
+```python
+# Training set class distribution
+TRAIN class counts [0..3]: [55, 1, 5, 20]
+# Healthy: 55, Very Mild: 1, Mild: 5, Moderate: 20
+
+# Computed inverse-frequency weights (normalized)
+class_weights = [0.0573, 3.1541, 0.6308, 0.1577]
+```
+
+**Weighted Loss Implementation**:
+```python
+def weighted_categorical_crossentropy(class_weights, epsilon=1e-7):
+    """
+    Apply class-specific weights to address imbalance
+    """
+    w = tf.constant(class_weights, dtype=tf.float32)
     
-    def __getitem__(self, index):
-        batch_images, batch_masks, batch_clinical = self.load_batch(index)
+    def loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+        logp = tf.math.log(y_pred)
         
-        if self.augment:
-            batch_images, batch_masks = self.apply_augmentation(
-                batch_images, batch_masks
-            )
+        # Weight per true class
+        w_per_sample = tf.reduce_sum(y_true * w, axis=-1)
+        ce = -tf.reduce_sum(y_true * logp, axis=-1)
         
-        return batch_images, {
-            'segmentation': batch_masks,
-            'classification': batch_clinical
-        }
+        return tf.reduce_mean(w_per_sample * ce)
+    return loss
+```
+
+**Configuration**:
+```python
+clf_loss = weighted_categorical_crossentropy(class_weights)
+
+model.compile(
+    optimizer=optimizer,
+    loss={
+        'seg': make_tversky_loss(alpha=0.5, beta=0.5),
+        'cdr_class': clf_loss  # Weighted loss
+    },
+    loss_weights={'seg': 0.9, 'cdr_class': 1.1},
+    metrics={
+        'seg': [dice_coef, jaccard_coef],
+        'cdr_class': ['accuracy']
+    }
+)
+```
+
+**Training Results** (20 epochs):
+- **Validation Dice**: 0.6697
+- **Validation Jaccard**: 0.5051
+- **Validation Classification Accuracy**: 0% (unstable)
+
+**Final Test Results**:
+```
+Mean Dice: 0.7102
+Mean Jaccard: 0.5530
+Classification Accuracy: 0.0000 (0/10 correct)
+```
+
+**Confusion Matrix**:
+```
+[[0, 0, 8, 0],    # Healthy: misclassified as Mild
+ [0, 0, 0, 0],    # Very Mild: none in test set
+ [0, 0, 0, 0],    # Mild: none in test set  
+ [0, 0, 2, 0]]    # Moderate: misclassified as Mild
+```
+
+**Issue**: Weighted loss caused model to predict all samples as Mild (class 2), likely due to the high weight assigned to the Very Mild class (3.15) with only 1 training sample.
+
+## Data Configuration
+
+### Dataset Split
+- **Training**: 81 subjects
+- **Validation**: 10 subjects  
+- **Test**: 11 subjects
+
+### Clinical Features
+```python
+feature_cols = ["Age", "MMSE", "eTIV", "nWBV", "ASF", "M/F", "Age_cat"]
+# 7 features total
+```
+
+### CDR Classification Mapping
+```python
+cdr_map = {
+    0.0: 'Healthy',      # CDR_Class: 0
+    2.0: 'Very Mild',    # CDR_Class: 1
+    1.0: 'Mild',         # CDR_Class: 2
+    0.5: 'Moderate'      # CDR_Class: 3
+}
+```
+
+## Loss Functions
+
+### Tversky Loss for Segmentation
+```python
+def make_tversky_loss(alpha=0.5, beta=0.5, smooth=1e-6):
+    """
+    Tversky loss for handling segmentation
+    alpha: weight for false positives
+    beta: weight for false negatives
+    """
+    def loss(y_true, y_pred):
+        y_true_f = K.flatten(y_true)
+        y_pred_f = K.flatten(y_pred)
+        
+        tp = K.sum(y_true_f * y_pred_f)
+        fp = K.sum((1 - y_true_f) * y_pred_f)
+        fn = K.sum(y_true_f * (1 - y_pred_f))
+        
+        tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+        return 1 - tversky
+    return loss
+```
+
+### Classification Loss Options
+
+1. **Standard Categorical Cross-Entropy**:
+```python
+'categorical_crossentropy'
+```
+
+2. **Weighted Categorical Cross-Entropy**:
+```python
+weighted_categorical_crossentropy(class_weights=[0.0573, 3.1541, 0.6308, 0.1577])
 ```
 
 ## Training Configuration
 
-### Enhanced Training Strategy
-
+### Common Hyperparameters
 ```python
-# Attention model compilation with refined parameters
-model.compile(
-    optimizer=Adam(learning_rate=0.0005),  # Slightly lower LR for stability
-    loss={
-        'segmentation': combined_loss,  # Dice + BCE loss
-        'classification': 'categorical_crossentropy'
-    },
-    loss_weights={
-        'segmentation': 1.0,
-        'classification': 0.8  # Slightly reduced classification weight
-    },
-    metrics={
-        'segmentation': [dice_coefficient, iou_metric],
-        'classification': ['accuracy', 'precision', 'recall']
-    }
+SEED = 42
+dropout_rate = 0  # Tested without dropout
+alpha, beta = 0.5, 0.5  # Balanced Tversky loss
+BATCH_SIZE = 4
+EPOCHS = 20
+learning_rate = 2e-3
+weight_decay = 1e-5
+
+# Steps calculation
+steps_per_epoch = math.ceil(81 / 4)  # 21 steps
+validation_steps = math.ceil(11 / 4)  # 3 steps
+```
+
+### Optimizer
+```python
+from keras.optimizers import AdamW
+
+optimizer = AdamW(
+    learning_rate=2e-3,
+    weight_decay=1e-5
 )
-
-# Enhanced loss function for segmentation
-def combined_loss(y_true, y_pred):
-    dice_loss = 1 - dice_coefficient(y_true, y_pred)
-    bce_loss = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-    return 0.5 * dice_loss + 0.5 * bce_loss
 ```
 
-### Training Hyperparameters
+## Performance Comparison
 
-- **Learning Rate**: 0.0005 (reduced for attention stability)
-- **Batch Size**: 4 (same as Stage A)
-- **Epochs**: 75-120 (increased for attention convergence)
-- **Optimizer**: Adam with beta1=0.9, beta2=0.999
-- **Regularization**: Dropout (0.1-0.2), BatchNormalization
+### Experiment Results Summary
 
-### Advanced Callbacks
+| Configuration | Loss Weights | Val Dice | Val Jaccard | Val Acc | Test Dice | Test Jaccard | Test Acc |
+|--------------|--------------|----------|-------------|---------|-----------|--------------|----------|
+| **Exp 1** | seg:0.8, cls:1.2 | 0.6615 | 0.4948 | 0% | 0.7147 | 0.5596 | 20% |
+| **Exp 2** | seg:0.9, cls:1.1 | 0.5539 | 0.4059 | 100% | 0.6136 | 0.4558 | 80% |
+| **Exp 3** | seg:0.9, cls:1.1 + WCE | 0.6697 | 0.5051 | 0% | 0.7102 | 0.5530 | 0% |
 
+**Key Findings**:
+1. **Best Segmentation**: Experiment 1 (Dice: 0.7147)
+2. **Best Classification**: Experiment 2 (Accuracy: 80%)
+3. **Most Balanced**: Experiment 2 offers best trade-off
+4. **Weighted Loss Issue**: Heavy class weights caused prediction bias
+
+### Training Dynamics
+
+#### Experiment 2 Training Progression:
+```
+Epoch 1:  Dice 0.0119 → Val_Dice 0.0080
+Epoch 5:  Dice 0.2072 → Val_Dice 0.0082
+Epoch 10: Dice 0.7796 → Val_Dice 0.0536
+Epoch 15: Dice 0.8360 → Val_Dice 0.2283
+Epoch 19: Dice 0.8278 → Val_Dice 0.8064  (best)
+Epoch 20: Dice 0.7876 → Val_Dice 0.5539
+```
+
+**Observation**: Validation metrics highly unstable, suggesting:
+- Small validation set (10 subjects) causes high variance
+- Model struggling to generalize classification
+- Segmentation more stable than classification
+
+## Evaluation Methodology
+
+### Test Evaluation Function
 ```python
-# Enhanced training callbacks
-callbacks = [
-    EarlyStopping(
-        monitor='val_segmentation_dice_coefficient',
-        patience=15,
-        restore_best_weights=True,
-        mode='max'
-    ),
-    ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.3,
-        patience=8,
-        min_lr=1e-7
-    ),
-    ModelCheckpoint(
-        'best_attention_model_stage_b.h5',
-        save_best_only=True,
-        monitor='val_segmentation_dice_coefficient',
-        mode='max'
-    ),
-    CSVLogger('training_log_stage_b.csv'),
-    AttentionVisualizationCallback()  # Custom callback for attention maps
-]
+def test_and_save_multimodal_classification(
+    model, test_pairs, df_features, feature_cols,
+    target_col="CDR_Class", out_dir="test_results",
+    threshold=0.5, num_classes=4,
+    class_names=('Healthy','Very Mild','Mild','Moderate')
+):
+    """
+    Comprehensive evaluation of joint model
+    """
+    # Segmentation metrics
+    dice_scores = []
+    jaccard_scores = []
+    
+    # Classification metrics
+    y_true_cls = []
+    y_pred_cls = []
+    
+    for img_path, lbl_path in test_pairs:
+        # Load and preprocess
+        img = normalize_image(load_nifti(img_path))
+        lbl = load_nifti(lbl_path)
+        
+        # Predict
+        seg_pred, class_pred = model.predict(...)
+        
+        # Calculate metrics
+        dice = dice_coef_np(lbl, pred_bin)
+        jaccard = jaccard_coef_np(lbl, pred_bin)
+        
+        # Store results
+        dice_scores.append(dice)
+        y_true_cls.append(true_class)
+        y_pred_cls.append(pred_class)
+    
+    # Generate comprehensive report
+    return {
+        'mean_dice': np.mean(dice_scores),
+        'mean_jaccard': np.mean(jaccard_scores),
+        'accuracy': accuracy_score(y_true_cls, y_pred_cls),
+        'confusion_matrix': confusion_matrix(...),
+        'classification_report': classification_report(...)
+    }
 ```
 
-## Key Improvements Over Stage A
+## Key Findings and Analysis
 
-### Performance Enhancements
+### Loss Weighting Insights
 
-1. **Improved Segmentation Accuracy**: ~3-5% improvement in Dice score
-2. **Better Feature Representation**: Attention mechanisms highlight relevant regions
-3. **Reduced False Positives**: Better background suppression
-4. **Enhanced Generalization**: Improved performance on test set
+1. **Segmentation vs Classification Balance**:
+   - Higher classification weight (1.2) → Better segmentation but poor classification
+   - Balanced weights (0.9/1.1) → Better overall performance
+   - Loss weight ratio critically affects task balance
 
-### Technical Advantages
+2. **Class Imbalance Challenges**:
+   - Training set highly imbalanced (Healthy:55, Very Mild:1, Mild:5, Moderate:20)
+   - Simple weighted loss can cause prediction bias
+   - Small classes (Very Mild with 1 sample) problematic for weighting
 
-1. **Selective Feature Focus**: Attention mechanisms guide feature learning
-2. **Multi-scale Attention**: Different attention scales for various features
-3. **Adaptive Feature Weighting**: Dynamic importance assignment
-4. **Better Skip Connections**: Attention-guided feature fusion
+3. **Training Instability**:
+   - Classification accuracy highly unstable during training
+   - Validation metrics fluctuate significantly
+   - Small validation set (10 subjects) exacerbates instability
+
+
+## Limitations and Challenges
+
+### Major Issues Identified
+
+1. **Class Imbalance**:
+   - Very Mild class has only 1 training sample
+   - Weighted loss causes severe prediction bias
+   - Model tends to overfit to majority class
+
+2. **Small Dataset**:
+   - 81 training samples insufficient for robust learning
+   - Validation set (10) too small for reliable metrics
+   - High variance in performance estimates
+
+3. **Task Interference**:
+   - Segmentation and classification objectives may conflict
+   - Loss weight tuning difficult without clear guidelines
+   - No clear optimal configuration found
+
+4. **Evaluation Challenges**:
+   - Test set lacks Very Mild and Mild samples
+   - Cannot assess full classification performance
+   - Metrics dominated by Healthy class
+
+### Recommendations for Improvement
+
+1. **Data Augmentation**:
+   - Synthetic oversampling for minority classes
+   - Advanced augmentation techniques
+   - Consider focal loss for class imbalance
+
+2. **Training Strategy**:
+   - Curriculum learning (train segmentation first)
+   - Gradual loss weight adjustment
+   - Longer training with early stopping
+
+3. **Architecture Modifications**:
+   - Separate encoders for each task
+   - Task-specific batch normalization
+   - Auxiliary losses for better gradients
+
+4. **Evaluation Improvements**:
+   - Cross-validation for robust estimates
+   - Stratified sampling in data splits
+   - Additional datasets for validation
 
 ## Usage Instructions
 
 ### Step 1: Environment Setup
-
-```python
-# Additional dependencies for attention mechanisms
-import tensorflow as tf
-from tensorflow.keras.layers import *
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import *
-
-# Custom attention modules
-from attention_modules import cbam_block_3d, spatial_attention_3d
+```bash
+pip install tensorflow==2.x nibabel pandas scikit-learn matplotlib seaborn
 ```
 
-### Step 2: Model Training
-
+### Step 2: Data Preparation
 ```python
-# Execute Stage B notebook:
-# 1. Load preprocessed data from Stage A
-# 2. Build attention-enhanced U-Net
-# 3. Configure training with refined hyperparameters
-# 4. Train with attention-aware callbacks
-# 5. Visualize attention maps
-# 6. Compare with Stage A results
+# Load preprocessed data
+df = pd.read_csv("strat_subset.csv")
+df["ID_num"] = df["ID"].str.split("_").str[1]
+
+# Encode categorical variables and CDR labels
+train_df, encoders = preprocess_csv(train_csv, fit=True)
+val_df, _ = preprocess_csv(val_csv, le_dict=encoders, fit=False)
 ```
 
-### Step 3: Attention Visualization
-
+### Step 3: Choose Experiment Configuration
 ```python
-# Visualize learned attention maps
-def visualize_attention_maps(model, sample_input):
-    attention_layer = model.get_layer('spatial_attention')
-    attention_model = Model(
-        inputs=model.input,
-        outputs=attention_layer.output
-    )
-    
-    attention_maps = attention_model.predict(sample_input)
-    
-    # Plot attention heatmaps overlaid on original images
-    plot_attention_overlay(sample_input, attention_maps)
+# Select configuration based on priority
+if prioritize_segmentation:
+    loss_weights = {'seg': 0.8, 'cdr_class': 1.2}
+elif prioritize_balanced:
+    loss_weights = {'seg': 0.9, 'cdr_class': 1.1}
+elif address_class_imbalance:
+    clf_loss = weighted_categorical_crossentropy(class_weights)
+    loss_weights = {'seg': 0.9, 'cdr_class': 1.1}
 ```
 
-## Expected Results
-
-### Performance Benchmarks
-
-| Metric | Stage A | Stage B | Improvement |
-|--------|---------|---------|-------------|
-| Segmentation Dice | 0.82 | 0.87 | +6.1% |
-| Segmentation IoU | 0.71 | 0.77 | +8.5% |
-| Classification Accuracy | 0.75 | 0.79 | +5.3% |
-| Hausdorff Distance | 12.3 | 9.8 | -20.3% |
-
-### Training Characteristics
-
-- **Convergence**: 40-60 epochs (slower than Stage A due to attention)
-- **Memory Usage**: ~10GB GPU memory (increased due to attention)
-- **Training Time**: ~3-4 hours on GPU
-- **Stability**: More stable training with attention regularization
-
-## Attention Analysis
-
-### Spatial Attention Patterns
-
-The learned spatial attention typically focuses on:
-- **Hippocampus Boundaries**: Enhanced edge detection
-- **Anatomical Landmarks**: Ventricles, surrounding structures
-- **Texture Variations**: Different tissue contrasts
-
-### Channel Attention Insights
-
-Channel attention learns to emphasize:
-- **High-frequency Features**: Edge and texture information
-- **Contextual Features**: Spatial relationships
-- **Multi-scale Information**: Features at different resolutions
-
-## Advanced Features
-
-### Attention Regularization
-
+### Step 4: Train Model
 ```python
-# Attention consistency loss for regularization
-def attention_consistency_loss(attention_maps):
-    # Encourage spatial smoothness in attention
-    spatial_tv = total_variation_3d(attention_maps)
-    
-    # Encourage attention sparsity
-    sparsity_loss = tf.reduce_mean(tf.abs(attention_maps))
-    
-    return 0.1 * spatial_tv + 0.05 * sparsity_loss
+# Build model
+model = build_att_unet3d_with_class(
+    input_shape=(128,128,128,1),
+    tabular_dim=7,
+    base_filters=32,
+    dropout_rate=0
+)
+
+# Compile
+model.compile(
+    optimizer=AdamW(learning_rate=2e-3, weight_decay=1e-5),
+    loss={'seg': make_tversky_loss(0.5, 0.5), 'cdr_class': clf_loss},
+    loss_weights=loss_weights,
+    metrics={'seg': [dice_coef, jaccard_coef], 'cdr_class': ['accuracy']}
+)
+
+# Train
+history = model.fit(
+    train_ds.repeat(),
+    epochs=20,
+    steps_per_epoch=21,
+    validation_data=val_ds,
+    validation_steps=3
+)
 ```
 
-### Multi-Head Attention
-
+### Step 5: Evaluate
 ```python
-# Multi-head attention for diverse feature focusing
-def multi_head_attention_3d(input_feature, num_heads=4):
-    heads = []
-    for i in range(num_heads):
-        head = cbam_block_3d(input_feature)
-        heads.append(head)
-    
-    # Concatenate and project multi-head outputs
-    concat_heads = Concatenate(axis=-1)(heads)
-    output = Conv3D(input_feature.shape[-1], 1)(concat_heads)
-    
-    return output
+# Test on validation set
+val_results = test_and_save_multimodal_classification(
+    model=model,
+    test_pairs=val_pairs,
+    df_features=val_df,
+    feature_cols=feature_cols,
+    target_col="CDR_Class",
+    out_dir="val_results",
+    num_classes=4
+)
 ```
 
 ## Files Structure
-
 ```
 Stage B/
-├── README.md                 # This documentation
-├── STAGE_B_final.ipynb      # Complete implementation
-├── attention_modules.py     # Custom attention layers (if separated)
-└── attention_visualization/ # Attention map visualizations
+├── README.md                              # This documentation
+├── STAGE_B_final.ipynb                      # Complete implementation
+├── val_results_AdamW_lw_0.8-1.2/     # AdamW, seg:0.8, cls:1.2 results
+├── val_results_AdamW_lw_0.9-1.1/     # AdamW, seg:0.9, cls:1.1 results
+└── val_results_AdamW_WCL_lw_0.9-1.1/ # AdamW, WCE, seg:0.9, cls:1.1 results
 ```
 
-## Troubleshooting
+## Conclusion
 
-### Common Issues
+Stage B demonstrates the critical importance of **loss weighting strategies** in multi-task learning. Key insights:
 
-1. **Gradient Vanishing**: Use gradient clipping and proper initialization
-2. **Attention Collapse**: Add attention regularization terms
-3. **Memory Issues**: Reduce batch size or use gradient checkpointing
-4. **Slow Convergence**: Adjust learning rate and warmup schedule
+1. **Loss Weight Balance**: The ratio between segmentation and classification losses significantly impacts performance. Balanced weights (0.9/1.1) provided the best overall results.
 
-### Performance Tips
+2. **Class Imbalance Challenge**: While weighted categorical cross-entropy is theoretically sound, extreme class imbalances (1 sample for Very Mild) can cause prediction bias and training instability.
 
-1. **Attention Placement**: Strategic placement of attention modules
-2. **Feature Scale**: Normalize features before attention computation
-3. **Training Schedule**: Use learning rate warmup for attention stability
-4. **Regularization**: Balance attention sparsity and model capacity
+3. **Trade-offs**: Improving one task often degrades the other. Experiment 2 offered the best balance with 80% classification accuracy and reasonable segmentation performance (Dice: 0.6136).
 
-## Next Steps
+4. **Dataset Limitations**: The small dataset (81 training samples) and severe class imbalance limit the effectiveness of advanced training strategies.
 
-After completing Stage B:
-
-1. **Attention Analysis**: Study learned attention patterns
-2. **Ablation Studies**: Test different attention configurations
-3. **Proceed to Stage C**: Incorporate multimodal data fusion
-4. **Performance Comparison**: Document improvements over baseline
+**Best Configuration**: Loss weights {seg: 0.9, cdr_class: 1.1} with standard categorical cross-entropy achieved the most stable and balanced performance.
 
 ---
 
-**Note**: Stage B demonstrates the effectiveness of attention mechanisms in medical image segmentation. The learned attention maps provide interpretable insights into model decision-making.
+**Note**: All experiments fully implemented. Results demonstrate the challenges of multi-task learning with imbalanced medical datasets and the need for careful hyperparameter tuning.
