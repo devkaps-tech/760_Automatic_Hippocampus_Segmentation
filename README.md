@@ -36,8 +36,9 @@ This project implements a multimodal deep learning framework for automatic hippo
    - Standard Python libraries (NumPy, Pandas, scikit-learn)
 
 3. **Dataset**
-   - OASIS-1 dataset: Publicly available from Washington University School of Medicine
+   - OASIS-1 MRI dataset and Demographic and Clinical Data: Publicly available from Washington University School of Medicine
    - Original data format and documentation from OASIS project
+   - Link: https://sites.wustl.edu/oasisbrains/home/oasis-1/
 
 ## How to Use This Code
 
